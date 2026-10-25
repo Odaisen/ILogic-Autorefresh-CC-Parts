@@ -1,0 +1,715 @@
+Imports System.Windows.Forms
+Imports System.IO
+Imports Inventor
+'===============================
+'AUTOMATIC REFRESH COMP LIBRARY
+'===============================
+
+Private Class UpdateChoiceResult
+    Public Answer As Boolean
+    Public Remember As Boolean
+    Public Scope As String
+    Public ReminderDate As DateTime
+End Class
+
+Private Class COMP_Settings
+	Public Const SESSION_SET_NAME As String = "COMP_SESSION"
+	Public Const REGISTRY_PATH As String = "Software\Inventor\COMP"
+	Public Const TESTING As Boolean = True
+End Class
+
+Private Enum TokenState
+    Missing
+    TrueValue
+    FalseValue
+    NothingValue
+End Enum
+
+
+'MAIN RULE LOGIC
+'---------------
+Sub Main()
+	Try
+		EnsureRegistryStructure()
+		If COMP_Settings.TESTING Then
+			DebugLog("====STARTING====")
+		End If
+		
+		'Assembly Check
+		If COMP_Settings.TESTING Then
+			DebugLog("INF - DOCUMENT: " & ThisApplication.ActiveDocument.FullFileName)
+			DebugLog("INF - TYPE: " & ThisApplication.ActiveDocument.DocumentType)
+		End If
+		If ThisApplication.ActiveDocument.DocumentType <> DocumentTypeEnum.kAssemblyDocumentObject
+			If COMP_Settings.TESTING Then
+				DebugLog("ERR - DOCUMENT TYPE NOT ASSEMBLY")
+			End If
+			Exit Sub
+		End If
+		
+		Dim AssDoc As AssemblyDocument = ThisApplication.ActiveDocument
+		Dim PID As String = System.Diagnostics.Process.GetCurrentProcess().Id.ToString()
+		Dim AssKey As String = CreateAssemblySessionKey(PID, AssDoc)
+		Dim SevenDayState As TokenState = GetSevenDayState()
+		If SevenDayState = TokenState.TrueValue Then
+			If COMP_Settings.TESTING Then
+				DebugLog("EXT - 7 DAY STATE TRUE")
+			End If
+			Exit Sub
+		End If
+		
+		If CheckNewSession(PID)
+			RemoveOldSessionSettings()
+			UpdateInventorPID(PID)
+			UpdateSessionPID(PID)
+			
+			'Check for any COMP library parts
+			If COMP_Settings.TESTING Then
+				DebugLog("====LOOKING FOR COMP LIBRARY PARTS====")
+			End If
+			If CheckForLibraryparts(AssDoc, "COMP")
+				If COMP_Settings.TESTING Then
+					DebugLog("INF - FOUND COMP PARTS")
+				End If
+				Dim Choice As UpdateChoiceResult
+				Choice = ShowUpdateDialog( _
+					"The CUSTOMLIBRARY has been updated." & vbCrLf & vbCrLf & _
+	    			"Would you like to refresh standard components?")
+				If Choice.Remember Then
+					SaveSettings(Choice, PID, AssKey)
+				End If
+				If Choice.Answer Then
+					'RUN REFRESH STANDARD COMPONENTS
+					If COMP_Settings.TESTING Then
+						DebugLog("INF - USER CHOSE TO UPDATE")
+					End If
+					If RunUpdate(AssDoc) Then
+						If COMP_Settings.TESTING Then
+							DebugLog("INF - UPDATE COMPLETE")
+						End If
+					End If
+				Else
+					If COMP_Settings.TESTING Then
+						DebugLog("EXT - USER CHOSE TO NOT UPDATE")
+					End If
+					Exit Sub
+				End If
+			Else
+				If COMP_Settings.TESTING Then
+					DebugLog("EXT - NO FOUND COMP PARTS")
+				End If
+				Return
+			End If
+		Else
+			Dim SessionState As TokenState = GetSessionState(PID)
+			If SessionState = TokenState.TrueValue Then
+				Dim SessionChoice As TokenState = GetSessionChoice()
+				If SessionChoice = TokenState.TrueValue
+					If COMP_Settings.TESTING Then
+						DebugLog("EXT - SESSION UPDATE DISABLED")
+					End If
+					Exit Sub
+				End If
+				If SessionChoice = TokenState.FalseValue Then
+					If COMP_Settings.TESTING Then
+						DebugLog("EXT - SESSION UPDATE ENABLED")
+					End If
+					If CheckForUpdate(AssDoc) = TokenState.TrueValue Then
+				        If RunUpdate(AssDoc) Then
+					        DebugLog("INF - UPDATE COMPLETE")
+					    End If
+				    End If
+				    Exit Sub
+				End If
+			End If
+		
+			Dim AssemblyKey As String = CreateAssemblySessionKey(PID, AssDoc)
+			Dim AssemblyState As TokenState = GetAssemblyState(AssemblyKey)
+			If AssemblyState = TokenState.TrueValue Then
+				If COMP_Settings.TESTING Then
+					DebugLog("EXT - ASSEMBLY UPDATE DISABLED")
+				End If
+				Exit Sub
+			End If
+			
+			If AssemblyState = TokenState.FalseValue Then
+				If CheckForUpdate(AssDoc) = TokenState.TrueValue Then
+					If COMP_Settings.TESTING Then
+						DebugLog("INF - ASSEMBLY AUTO UPDATE ENABLED")
+					End If
+					If RunUpdate(AssDoc) Then
+					    DebugLog("INF - UPDATE COMPLETE")
+					End If
+				End If
+				Exit Sub
+			End If
+			If AssemblyState = TokenState.Missing Then
+				If CheckForUpdate(AssDoc) = TokenState.TrueValue Then
+					If COMP_Settings.TESTING Then
+						DebugLog("INF - FIRST TIME RUNNING, AUTOUPDATING")
+					End If
+					If RunUpdate(AssDoc) Then
+			            If COMP_Settings.TESTING Then
+			                DebugLog("INF - UPDATE COMPLETE")
+			            End If
+			        End If
+				End If
+				Exit Sub
+			End If
+		End If
+	Catch ex As Exception
+		If COMP_Settings.TESTING Then
+			DebugLog("ERR - MAIN SUB EXCEPTION: " & ex.Message)
+			MessageBox.Show("MAIN SUB EXCEPTION: " & ex.Message)
+		End If
+	End Try
+End Sub
+
+
+'UPDATE SUB-FUNCTION
+'-------------------
+Function RunUpdate(AssDoc As AssemblyDocument) As Boolean
+	If COMP_Settings.TESTING Then
+		DebugLog("====UPDATING=====")
+	End If
+	'SAVING DOCUMENT
+	Try
+		If AssDoc.Dirty Then
+	        AssDoc.Save()
+	    End If
+	Catch ex As Exception
+		If COMP_Settings.TESTING Then
+			DebugLog("ERR - COULD NOT SAVE ASSEMBLY")
+		End If
+		Return False
+	End Try
+	
+	'RECORDING CURRENT STATE
+	Dim DirtyBefore As New Dictionary(Of String, Boolean)
+	For Each Doc As Document In ThisApplication.Documents
+		If Doc.FullFileName <> "" Then
+			DirtyBefore(Doc.FullFileName) = Doc.Dirty
+		End If
+	Next
+	
+	'REFRESH STANDARD COMPONENTS
+	If Not GetSilentRunState() Then
+		Dim Result As DialogResult = MessageBox.Show( _
+		"Refreshing standard components may check out every affected library part from Vault." & _
+		vbCrLf & vbCrLf & _
+		"Please choose 'Yes' when prompted to check out files." & _
+		vbCrLf & vbCrLf & _
+		"After the update completes, please choose 'No' if Vault asks whether to keep the files checked out.", _
+		"COMP Library Update", _
+		MessageBoxButtons.OK, _
+        MessageBoxIcon.Warning)
+	End If
+	Try
+		Dim RefreshCMD As ControlDefinition
+		RefreshCMD = ThisApplication.CommandManager.ControlDefinitions.Item("CCV2RSCButton")
+		RefreshCMD.Execute()
+	Catch ex As Exception
+		MessageBox.Show("ERROR: " & ex.Message) 'TODO: MAKE INTO PROPER ERROR BOX
+		If COMP_Settings.TESTING Then
+			DebugLog("ERR - COULD NOT START REFRESH STANDARD COMPONENTS")
+		End If
+		Return False
+	End Try
+	
+	'CHECK FOR UPDATE
+	Dim Changed As Boolean = False
+	For Each Doc As Document In ThisApplication.Documents
+		If Doc.FullFileName <> "" Then
+			If Doc.Dirty Then
+				Changed = True
+				Exit For
+			End If
+		End If
+	Next
+	If Changed = False Then
+		'TODO: ADD LOGIC IF NOTHING CHANGES (THEY MIGHT HAVE EXITED REFRESH STANDARD COMPONENTS?)
+		Return False
+	End If
+	
+	'SAVE
+	Try
+		ThisApplication.Documents.SaveAll()
+	Catch ex As Exception
+		If COMP_Settings.TESTING Then
+			DebugLog("ERR - COULD NOT SAVE AFTER REFRESH")
+		End If
+		Return False
+	End Try
+	
+	'CHECK IN CHANGES
+	Try
+		Dim CheckInCMD As ControlDefinition
+		CheckInCMD = ThisApplication.CommandManager.ControlDefinitions.Item("VaultCheckIn")
+		CheckInCMD.Execute()
+	Catch ex As Exception
+		If COMP_Settings.TESTING Then
+			DebugLog("ERR - COULD NOT START VAULT CHECKIN")
+		End If
+		Return False
+	End Try
+	
+	'UPDATE COMP ASSEMBLY VERSION
+	UpdateCOMPVersion(AssDoc)
+	If Not GetSilentRunState() Then
+		ThisApplication.StatusBarText = "COMP Library Update Complete"
+	End If
+	Return True
+End Function
+
+'7DAY SETTING HANDLING
+'---------------------
+Private Function GetSevenDayState() As TokenState
+	Dim Expiry As Object = My.Computer.Registry.GetValue("HKEY_CURRENT_USER\" & COMP_Settings.REGISTRY_PATH & "\SETTINGS\7DAY", "Expiry", Nothing)
+	If Expiry Is Nothing Then Return TokenState.Missing
+	Dim ExpiryDate As DateTime
+	If DateTime.TryParse(Expiry.ToString(), ExpiryDate) Then
+		If ExpiryDate > DateTime.Now Then
+			Return TokenState.TrueValue
+		End If
+	End If
+	Return TokenState.FalseValue
+End Function
+
+Function GetSevenDayChoice() As TokenState
+	Dim Choice As Object = My.Computer.Registry.GetValue("HKEY_CURRENT_USER\" & COMP_Settings.REGISTRY_PATH & "\SETTINGS\7DAY", "Choice", Nothing)
+	If Choice Is Nothing Then Return TokenState.Missing
+	If CBool(Choice) Then
+		Return TokenState.TrueValue
+	Else
+		Return TokenState.FalseValue
+	End If
+End Function
+
+
+'SESSION SETTING HANDLING
+'------------------------
+Function GetSessionState(PID As String) As TokenState
+	Dim Value As Object =  My.Computer.Registry.GetValue("HKEY_CURRENT_USER\" & COMP_Settings.REGISTRY_PATH & "\SETTINGS\SESSION", "PID", Nothing)
+	If Value Is Nothing Then Return TokenState.Missing
+	If Value = PID Then Return TokenState.TrueValue
+	Return TokenState.FalseValue
+End Function
+
+Function GetSessionChoice() As TokenState 'Only use if session is valid (ie function above returned true)
+	Dim Choice As Object =  My.Computer.Registry.GetValue("HKEY_CURRENT_USER\" & COMP_Settings.REGISTRY_PATH & "\SETTINGS\SESSION", "Choice", Nothing)
+	If Choice Is Nothing Then Return TokenState.Missing
+	If Choice = True Then Return TokenState.TrueValue
+	Return TokenState.FalseValue
+End Function
+
+
+'ASSEMBLY SETTING HANDLING
+'-------------------------
+Function CreateAssemblySessionKey(PID As String, AssDoc As AssemblyDocument) As String
+	Dim FileName As String = System.IO.Path.GetFileNameWithoutExtension(AssDoc.FullFileName)
+	For Each c As Char In System.IO.Path.GetInvalidFileNameChars()
+		FileName = FileName.Replace(c, "-"c)
+	Next
+	FileName = FileName.Replace(" ", "-").Replace(".", "_")
+	If FileName.Length > 100 Then FileName = FileName.Substring(0, 100)
+	Return PID & "_" & FileName
+End Function
+
+Private Function GetAssemblyState(Key As String) As TokenState
+	Dim Value As Object = My.Computer.Registry.GetValue("HKEY_CURRENT_USER\" & COMP_Settings.REGISTRY_PATH & "\SETTINGS\ASSEMBLY", Key, Nothing)
+	If Value Is Nothing Then Return TokenState.Missing
+	If Value = True Then Return TokenState.TrueValue
+	If Value = False Then Return TokenState.FalseValue
+	Return TokenState.NothingValue
+End Function
+
+
+'SILENTRUN UPDATE SETTING
+'------------------------
+Sub EnableSilentRun()
+	My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH & "\SETTINGS", "SilentRun", True)
+End Sub
+
+Function GetSilentRunState() As Boolean
+	Dim Value As Object = My.Computer.Registry.GetValue("HKEY_CURRENT_USER\" & COMP_Settings.REGISTRY_PATH & "\SETTINGS", "SilentRun", Nothing)
+	If Value Is Nothing Then Return False
+	Return Convert.ToBoolean(Value)
+End Function
+
+
+'ENSURES COMP REGUSTRY STRUCTURE
+'--------------------------------
+Sub EnsureRegistryStructure()
+    Using COMPKey = My.Computer.Registry.CurrentUser.CreateSubKey(COMP_Settings.REGISTRY_PATH)
+        COMPKey.CreateSubKey("SETTINGS")
+        Using SettingsKey = COMPKey.CreateSubKey("SETTINGS")
+            SettingsKey.CreateSubKey("ASSEMBLY")
+            SettingsKey.CreateSubKey("SESSION")
+            SettingsKey.CreateSubKey("7DAY")
+        End Using
+    End Using
+End Sub
+
+
+'SESSION CONTROL
+'---------------
+Private Function CheckNewSession(CurrentPID As String) As Boolean
+	If COMP_Settings.TESTING Then
+		DebugLog("INF - CURRENT PROCESS ID: " & CurrentPID)
+	End If
+	Dim Value As Object = My.Computer.Registry.GetValue("HKEY_CURRENT_USER\" & COMP_Settings.REGISTRY_PATH, "InventorPID", Nothing)
+	If Value Is Nothing Then
+	    Return True
+	End If
+	Dim PreviousPID As String = Value.ToString()
+	If COMP_Settings.TESTING Then
+		DebugLog("INF - PREVIOUS PROCESS ID: " & PreviousPID)
+	End If
+	Return CurrentPID <> PreviousPID
+End Function
+
+Private Function UpdateInventorPID(PID As String)
+	My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH, "InventorPID", PID)
+	If COMP_Settings.TESTING Then
+		DebugLog("INF - UPDATED PID TO: " & PID)
+	End If
+End Function
+
+Sub RemoveOldSessionSettings()
+	Try
+		My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH, "InventorPID", Nothing)
+		My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH & "\SETTINGS", "SilentRun", False)
+		If COMP_Settings.TESTING Then
+			DebugLog("INF - INVENTOR PID CLEARED")
+		End If
+	Catch ex As Exception
+		If COMP_Settings.TESTING Then
+			DebugLog("ERR - FAILED CLEARING INVENTOR PID: " & ex.Message)
+		End If
+	End Try
+	
+	Try
+		Dim AssemblySettingsPath = My.Computer.Registry.CurrentUser.OpenSubKey(COMP_Settings.REGISTRY_PATH & "\SETTINGS\ASSEMBLY", True)
+		If AssemblySettingsPath IsNot Nothing Then
+			Dim Values() As String = AssemblySettingsPath.GetValueNames()
+			For Each ValueName As String In Values
+				AssemblySettingsPath.DeleteValue(ValueName)
+			Next
+			AssemblySettingsPath.Close()
+			If COMP_Settings.TESTING Then
+				DebugLog("INF - ASSEMBLY SETTINGS CLEARED")
+			End If
+		End If
+	Catch ex As Exception
+		If COMP_Settings.TESTING Then
+			DebugLog("ERR - FAILED CLEARING ASSEMBLY SETTINGS: " & ex.Message)
+		End If
+	End Try
+	
+	Try
+		My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH & "\SETTINGS\SESSION", "PID", Nothing)
+		My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH & "\SETTINGS\SESSION", "Choice", Nothing)
+		If COMP_Settings.TESTING Then
+			DebugLog("INF - SESSION SETTINGS CLEARED")
+		End If
+	Catch ex As Exception
+		If COMP_Settings.TESTING Then
+			DebugLog("ERR - FAILED CLEARING SESSION SETTINGS: " & ex.Message)
+		End If
+	End Try
+End Sub
+
+Sub UpdateSessionPID(PID As String)
+	My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH & "\SETTINGS\SESSION", "PID", PID)
+End Sub
+
+
+'CHECK FOR COMP PARTS
+'---------------------
+Private Function CheckForLibraryparts(AssDoc As AssemblyDocument, WantedLibraryName As String) As Boolean
+	Return CheckOccurrences(AssDoc.ComponentDefinition.Occurrences, WantedLibraryName)
+End Function
+
+Private Function CheckOccurrences(Occurrences As ComponentOccurrences, WantedLibraryName As String) As Boolean
+	For Each Occ As ComponentOccurrence In Occurrences
+		If Occ.Suppressed Then Continue For
+		If Occ.Definition Is Nothing Then Continue For
+		If Occ.DefinitionDocumentType = DocumentTypeEnum.kPartDocumentObject Then
+			Dim PartDoc As PartDocument = TryCast(Occ.Definition.Document, PartDocument)
+			If PartDoc Is Nothing Then Continue For
+			Dim LibraryName As String = ""
+			Try
+				LibraryName = PartDoc.PropertySets.Item("Inventor User Defined Properties").Item("Library").Value
+			Catch
+				LibraryName = ""
+			End Try
+			If String.Equals(LibraryName, WantedLibraryName, StringComparison.OrdinalIgnoreCase) Then
+				Return True
+			End If
+		ElseIf Occ.DefinitionDocumentType = DocumentTypeEnum.kAssemblyDocumentObject Then
+			If CheckOccurrences(Occ.SubOccurrences, WantedLibraryName) Then
+				Return True
+			End If
+		End If
+	Next
+	Return False
+End Function
+
+
+'CHECK COMP LIBRARY VERSION
+'---------------------------
+Private Function GetCurrentLibraryVersion() As String
+	Dim VersionDoc As Document = Nothing
+	Dim LibraryVersion As String = ""
+	
+	Try
+		Dim VaultPath As String = "$/Resources/Templates/Other/COMP Library Version.ipt"
+		Dim VersionFile As String = ""
+		Try
+			VersionFile = iLogicVault.GetFileByFullFilePath(VaultPath)
+		Catch ex As Exception
+			If COMP_Settings.TESTING Then
+				DebugLog("ERR - FAILED GETTING LIBRARY VERSION: " & ex.Message)
+			End If
+			Return ""
+		End Try
+		
+		If String.IsNullOrEmpty(VersionFile) Then
+			If COMP_Settings.TESTING Then
+				DebugLog("ERR - VERSIONFILE NOT FOUND")
+			End If
+			Return ""
+		End If
+		
+		Try
+			VersionDoc = ThisApplication.Documents.Open(VersionFile, False)
+		Catch ex As Exception
+			If COMP_Settings.TESTING Then
+				DebugLog("ERR - FAILED OPENING VERSION FILE: " & ex.Message)
+			End If
+			Return ""
+		End Try
+		
+		Dim LibraryVersion As String = ""
+		Try
+			LibraryVersion = VersionDoc.PropertySets.Item("Design Tracking Properties").Item("Description").Value.ToString()
+		Catch ex As Exception
+			If COMP_Settings.TESTING Then
+				DebugLog("ERR - FAILED READING VERSION: " & ex.Message)
+			End If
+		End Try
+	Finally
+		If VersionDoc IsNot Nothing Then
+			VersionDoc.Close(False)
+		End If
+	End Try
+	
+	Return LibraryVersion
+End Function
+
+
+
+Private Function CheckForUpdate(AssDoc As AssemblyDocument) As TokenState
+	Dim LibraryVersion As String = GetCurrentLibraryVersion()
+	If LibraryVersion = "" Then
+		Return TokenState.FalseValue
+	End If
+	
+	Dim CurrentVersion As String = ""
+	Try
+		CurrentVersion = AssDoc.PropertySets.Item("Inventor User Defined Properties").Item("COMP_VERSION").Value.ToString()
+	Catch ex As Exception
+		If COMP_Settings.TESTING Then
+			DebugLog("ERR - FAILED GETTING CURRENT VERSION: " & ex.Message)
+		End If
+		CurrentVersion = ""
+	End Try
+	
+	If CurrentVersion = LibraryVersion Then
+		If COMP_Settings.TESTING Then
+			DebugLog("INF - VERSION MATCH")
+		End If
+		Return TokenState.FalseValue
+	Else
+		If COMP_Settings.TESTING Then
+			DebugLog("INF - VERSION MISMATCH")
+		End If
+		Return TokenState.TrueValue
+	End If
+End Function
+
+Sub UpdateCOMPVersion(AssDoc As AssemblyDocument)
+	Dim NewVersion As String = GetCurrentLibraryVersion()
+	
+    If NewVersion = "" Then
+		If COMP_Settings.TESTING Then
+			DebugLog("ERR - NO VERSION AVAILABLE")
+		End If
+        Exit Sub
+    End If
+	
+    Dim UserProps As PropertySet
+    Try
+        UserProps = AssDoc.PropertySets.Item("Inventor User Defined Properties")
+    Catch
+        UserProps = AssDoc.PropertySets.Add("Inventor User Defined Properties")
+    End Try
+    Try
+		UserProps.Item("COMP_VERSION").Value = NewVersion
+	Catch
+		UserProps.Add(NewVersion, "COMP_VERSION")
+	End Try
+	
+	AssDoc.Save()
+End Sub
+
+
+'USER PROMPT INCL-REMEMBER OPTIONS
+'---------------------------------
+
+Private Function ShowUpdateDialog(Message As String) As UpdateChoiceResult
+    Dim Result As New UpdateChoiceResult
+    Dim DlgRes As DialogResult
+    Dim Form As New Form()
+	
+	'GENERAL SETTINGS
+    Form.Text = "Library Update"
+    Form.Width = 320
+    Form.Height = 200
+    Form.StartPosition = FormStartPosition.CenterScreen
+    Form.FormBorderStyle = FormBorderStyle.FixedDialog
+    Form.MaximizeBox = False
+    Form.MinimizeBox = False
+
+    'MESSAGE TEXT
+    Dim Lbl As New Label()
+    Lbl.Text = Message
+    Lbl.Left = 20
+    Lbl.Top = 20
+    Lbl.Width = 260
+    Lbl.Height = 35
+    Lbl.AutoSize = False
+    Form.Controls.Add(Lbl)
+
+    'REMEMBER CHECKBOX BOOLEAN
+    Dim ChkRem As New CheckBox()
+    ChkRem.Text = "Remember my choice"
+    ChkRem.Left = 30
+    ChkRem.Top = 60
+    ChkRem.Width = 200
+    Form.Controls.Add(ChkRem)
+
+    'RADIO BUTTONS
+    Dim RbAss As New RadioButton()
+    RbAss.Text = "This assembly"
+    RbAss.Left = 30
+    RbAss.Top = 80
+	RbAss.Width = 100
+	RbAss.Checked = True
+    Form.Controls.Add(RbAss)
+
+    Dim RbSes As New RadioButton()
+    RbSes.Text = "This session"
+    RbSes.Left = 135
+    RbSes.Top = 80
+	RbSes.Width = 90
+    Form.Controls.Add(RbSes)
+
+    Dim Rb7D As New RadioButton()
+    Rb7D.Text = "7 Days"
+    Rb7D.Left = 225
+    Rb7D.Top = 80
+	Rb7D.Width = 100
+    Form.Controls.Add(Rb7D)
+	
+	RbAss.Enabled = False
+	RbSes.Enabled = False
+	Rb7D.Enabled = False
+	
+	'ENABLE/DISABLE OPTIONS WHEN CHECKBOX CHANGES
+	AddHandler ChkRem.CheckedChanged,
+	Sub()
+	    Dim Enabled As Boolean = ChkRem.Checked
+	    RbAss.Enabled = Enabled
+	    RbSes.Enabled = Enabled
+	    Rb7D.Enabled = Enabled
+	    If Not Enabled Then
+	        RbAss.Checked = True
+	    End If
+	End Sub
+
+    'BUTTONS
+    Dim BtYes As New Button()
+    BtYes.Text = "Yes"
+    BtYes.Left = 110
+    BtYes.Top = 120
+    BtYes.Width = 70
+    BtYes.DialogResult = DialogResult.Yes
+    Form.Controls.Add(BtYes)
+
+    Dim BtNo As New Button()
+    BtNo.Text = "No"
+    BtNo.Left = 200
+    BtNo.Top = 120
+    BtNo.Width = 70
+    BtNo.DialogResult = DialogResult.No
+    Form.Controls.Add(BtNo)
+
+    Form.AcceptButton = BtYes
+    Form.CancelButton = BtNo
+	BtYes.Select()
+	
+    'SHOW DIALOG
+    DlgRes = Form.ShowDialog()
+
+    'RETURN VALUES
+    If DlgRes = DialogResult.Yes Then
+        Result.Answer = True
+    Else
+        Result.Answer = False
+    End If
+
+    Result.Remember = ChkRem.Checked
+
+    If RbSes.Checked Then
+        Result.Scope = "Session"
+        Result.ReminderDate = DateTime.MinValue
+    ElseIf Rb7D.Checked Then
+        Result.Scope = "7 Days"
+        Result.ReminderDate = DateTime.Now.AddDays(7)
+    Else
+        Result.Scope = "This Assembly"
+        Result.ReminderDate = DateTime.MinValue
+    End If
+    Return Result
+End Function
+
+
+'SAVE SETTINGS
+'-------------
+Sub SaveSettings(Result As UpdateChoiceResult, PID As String, Key As String)
+	If Not Result.Remember Then Exit Sub
+	Select Case Result.Scope
+		Case "This Assembly"
+			My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH & "\SETTINGS\ASSEMBLY", Key, Result.Answer)
+			
+		Case "Session"
+			My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH & "\SETTINGS\SESSION", "PID", PID)
+			My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH & "\SETTINGS\SESSION", "Choice", Result.Answer)
+			
+		Case "7 Days"
+			My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH & "\SETTINGS\7DAY", "Expiry", Result.ReminderDate)
+			My.Computer.Registry.SetValue(COMP_Settings.REGISTRY_PATH & "\SETTINGS\7DAY", "Choice", Result.Answer)
+	End Select
+End Sub
+
+'DEBUGLOG
+'--------
+Sub DebugLog(Msg As String)
+	Dim LogFile As String = "C:\Temp\COMP_Debug.txt"
+	Try
+		If Not Directory.Exists("C:\Temp") Then Directory.CreateDirectory("C:\Temp")
+		System.IO.File.AppendAllText(LogFile, Date.Now.ToString("yyyy-MMdd HH:mm:ss") & " : " & Msg & vbCrLf)
+	Catch
+	End Try
+End Sub
